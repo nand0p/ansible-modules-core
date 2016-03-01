@@ -25,6 +25,7 @@ version_added: "1.5"
 author:
   - "Jim Dalton (@jsdalton)"
   - "Rick Mendes (@rickmendes)"
+  - "Fernando Jose Pando (@nand0p)"
 options:
   state:
     description:
@@ -155,9 +156,18 @@ options:
     default: 60
     version_added: "2.1"
   tags:
-    description:
-      - An associative array of tags. To delete all tags, supply an empty dict.
+    description: the tags dict to apply
+    type: dict
     required: false
+    sample: { "Department": "Information Retrieval" }
+    version_added: "2.1"
+  append_tags:
+    description:
+      - When specified, tags will be appended instead of overwriten.
+    type: bool
+    required: false
+    default: False
+    choices: ["True", "False"]
     version_added: "2.1"
 
 extends_documentation_fragment:
@@ -170,7 +180,6 @@ EXAMPLES = """
 # It is assumed that their matching environment variables are set.
 
 # Basic provisioning example (non-VPC)
-
 - local_action:
     module: ec2_elb_lb
     name: "test-please-delete"
@@ -191,7 +200,6 @@ EXAMPLES = """
         ssl_certificate_id: "arn:aws:iam::123456789012:server-certificate/company/servercerts/ProdServerCert"
 
 # Internal ELB example
-
 - local_action:
     module: ec2_elb_lb
     name: "test-vpc"
@@ -353,10 +361,10 @@ EXAMPLES = """
       enabled: yes
       cookie: SESSIONID
 
-# Create an ELB and add tags
+# Add tags to ELB and ensure any existing tags are kept
 - local_action:
     module: ec2_elb_lb
-    name: "New ELB"
+    name: "loadbalancer"
     state: present
     region: us-east-1
     zones:
@@ -367,9 +375,9 @@ EXAMPLES = """
       - load_balancer_port: 80
       - instance_port: 80
     tags:
-      Name: "New ELB"
-      stack: "production"
-      client: "Bob"
+      Department: "Information Retrieval"
+    append_tags: True
+
 
 # Delete all tags from an ELB
 - local_action:
@@ -398,6 +406,13 @@ try:
 except ImportError:
     HAS_BOTO = False
 
+try:
+    import boto3
+    import botocore
+    HAS_BOTO3 = True
+except ImportError:
+    HAS_BOTO3 = False
+
 import time
 import random
 
@@ -425,15 +440,31 @@ _THROTTLING_RETRIES = 5
 class ElbManager(object):
     """Handles ELB creation and destruction"""
 
-    def __init__(self, module, name, listeners=None, purge_listeners=None,
-                 zones=None, purge_zones=None, security_group_ids=None,
-                 health_check=None, subnets=None, purge_subnets=None,
-                 scheme="internet-facing", connection_draining_timeout=None,
+    def __init__(self,
+                 module,
+                 name,
+                 region,
+                 listeners=None,
+                 purge_listeners=None,
+                 zones=None,
+                 purge_zones=None,
+                 security_group_ids=None,
+                 health_check=None,
+                 subnets=None,
+                 purge_subnets=None,
+                 scheme="internet-facing",
+                 connection_draining_timeout=None,
                  idle_timeout=None,
-                 cross_az_load_balancing=None, access_logs=None,
-                 stickiness=None, wait=None, wait_timeout=None, tags=None,
-                 region=None,
-                 instance_ids=None, purge_instance_ids=None, **aws_connect_params):
+                 cross_az_load_balancing=None,
+                 access_logs=None,
+                 stickiness=None,
+                 wait=None,
+                 wait_timeout=None,
+                 tags=None,
+                 append_tags=False,
+                 instance_ids=None,
+                 purge_instance_ids=None,
+                 **aws_connect_params):
 
         self.module = module
         self.name = name
@@ -455,16 +486,18 @@ class ElbManager(object):
         self.stickiness = stickiness
         self.wait = wait
         self.wait_timeout = wait_timeout
-        self.tags = tags
-        
         self.aws_connect_params = aws_connect_params
         self.region = region
-
         self.changed = False
+        self.changer = []
         self.status = 'gone'
         self.elb_conn = self._get_elb_connection()
         self.elb = self._get_elb()
         self.ec2_conn = self._get_ec2_connection()
+        self.append_tags = append_tags
+        self.tags = tags
+        self.tags_existing = {}
+        self.tags_delete = {}
 
     @_throttleable_operation(_THROTTLING_RETRIES)
     def ensure_ok(self):
@@ -478,6 +511,7 @@ class ElbManager(object):
             self._set_elb_listeners()
             self._set_subnets()
         self._set_health_check()
+
         # boto has introduced support for some ELB attributes in
         # different versions, so we check first before trying to
         # set them to avoid errors
@@ -489,15 +523,23 @@ class ElbManager(object):
             self._set_cross_az_load_balancing()
         if self._check_attribute_support('access_log'):
             self._set_access_log()
+
         # add sitcky options
         self.select_stickiness_policy()
 
         # ensure backend server policies are correct
         self._set_backend_policies()
+
         # set/remove instance ids
         self._set_instance_ids()
 
-        self._set_tags()
+        # tag elb
+        if self.tags is not None:
+            if HAS_BOTO3:
+                boto3_conn = self._get_boto3_conn()
+                self._elb_set_tags_boto3(boto3_conn)
+            else:
+                self._elb_set_tags_boto2()
         
     def ensure_gone(self):
         """Destroy the ELB"""
@@ -552,7 +594,13 @@ class ElbManager(object):
                 'out_of_service_count': 0,
                 'in_service_count': 0,
                 'unknown_instance_state_count': 0,
-                'region': self.region
+                'region': self.region,
+                'tags_existing': self.tags_existing,
+                'tags_new': self.tags,
+                'tags_delete': self.tags_delete,
+                'tags_append': self.append_tags,
+                'changer': self.changer,
+                'stickiness': self.stickiness
             }
 
             # status of instances behind the ELB
@@ -609,13 +657,88 @@ class ElbManager(object):
                 else:
                     info['cross_az_load_balancing'] = 'no'
 
-            # return stickiness info?
-            
-            info['tags'] = self.tags
-
         return info
 
     @_throttleable_operation(_THROTTLING_RETRIES)
+    def _get_boto3_conn(self):
+        # TODO: this breaks backwards compatibility
+        #       is there a way to detect boto3 support
+        #       in lib/ansible/module_utils/ec2.py?
+
+        #try:
+        #    region, ec2_url, aws_connect_kwargs = get_aws_connection_info(self.module, boto3=True)
+        #    return boto3_conn(self.module, conn_type='client', resource='elb', region=region, endpoint=ec2_url, **aws_connect_kwargs)
+        #except botocore.exceptions.ClientError, err:
+        #    self.module.fail_json(msg='Cannot connect: ' + err.message)
+        return boto3.client('elb')
+
+    def _elb_set_tags_boto3(self, boto3_conn):
+        self.tags_existing = {}
+        tags_existing_raw = boto3_conn.describe_tags(LoadBalancerNames = \
+                            [ self.name ])['TagDescriptions'][0]['Tags']
+
+        if tags_existing_raw:
+            for tag in tags_existing_raw:
+                self.tags_existing[tag['Key']] = tag['Value']
+
+        if not self.append_tags and cmp(self.tags, self.tags_existing):
+            self.tags_delete = dict(set(self.tags_existing.items()) - set(self.tags.items()))
+            self._elb_purge_tags(boto3_conn)
+
+        if not set(self.tags.items()).issubset(set(self.tags_existing.items())):
+            tags_formatted = [ { "Key": key, "Value": value }
+                               for key, value in self.tags.items() ]
+            try:
+                boto3_conn.add_tags(LoadBalancerNames = \
+                [ self.name ], Tags = tags_formatted)
+            except botocore.exceptions.ClientError, err:
+                self.module.fail_json(msg='Failed to create/update ELB tags: ' + err.message)
+            self.changed = True
+            self.changer.append("_elb_set_tags_boto3")
+
+    def _elb_set_tags_boto2(self):
+        params = {'LoadBalancerNames.member.1': self.name}
+        tagdict = dict()
+
+        # get the current list of tags from the ELB, if ELB exists
+        if self.elb:
+            current_tags = self.elb_conn.get_list('DescribeTags', params,
+                                                  [('member', Tag)])
+            tagdict = dict((tag.Key, tag.Value) for tag in current_tags
+                           if hasattr(tag, 'Key'))
+
+        # Add missing tags
+        dictact = dict(set(self.tags.items()) - set(tagdict.items()))
+        if dictact:
+            for i, key in enumerate(dictact):
+                params['Tags.member.%d.Key' % (i + 1)] = key
+                params['Tags.member.%d.Value' % (i + 1)] = dictact[key]
+
+            self.elb_conn.make_request('AddTags', params)
+            self.changed=True
+            self.changer.append("_elb_set_tags_boto2")
+
+        # Remove extra tags
+        dictact = dict(set(tagdict.items()) - set(self.tags.items()))
+        if dictact:
+            for i, key in enumerate(dictact):
+                params['Tags.member.%d.Key' % (i + 1)] = key
+
+            self.elb_conn.make_request('RemoveTags', params)
+            self.changed=True
+            self.changer.append("_elb_set_tags_boto2")
+
+    def _elb_purge_tags(self, boto3_conn):
+        if self.tags_delete:
+            tags_formatted = [ { 'Key': tag } for tag in self.tags_delete.keys() ]
+            try:
+                boto3_conn.remove_tags(LoadBalancerNames = \
+                [ self.name ], Tags = tags_formatted)
+            except botocore.exceptions.ClientError, err:
+                self.module.fail_json(msg='Failed to purge ELB tags: ' + err.message)
+            self.changed = True
+            self.changer.append("_elb_purge_tags")
+
     def _wait_for_elb_removed(self):
         polling_increment_secs = 15
         max_retries = (self.wait_timeout / polling_increment_secs)
@@ -673,7 +796,7 @@ class ElbManager(object):
         try:
             return connect_to_aws(boto.ec2.elb, self.region,
                                   **self.aws_connect_params)
-        except (boto.exception.NoAuthHandlerFound, AnsibleAWSError) as e:
+        except (boto.exception.NoAuthHandlerFound, StandardError), e:
             self.module.fail_json(msg=str(e))
 
     def _get_ec2_connection(self):
@@ -689,6 +812,7 @@ class ElbManager(object):
         result = self.elb_conn.delete_load_balancer(name=self.name)
         if result:
             self.changed = True
+            self.changer.append("_delete_elb")
             self.status = 'deleted'
 
     def _create_elb(self):
@@ -711,6 +835,7 @@ class ElbManager(object):
             # See https://github.com/boto/boto/issues/3526
             self.elb.listeners = self.listeners
             self.changed = True
+            self.changer.append("_create_elb")
             self.status = 'created'
 
     def _create_elb_listeners(self, listeners):
@@ -718,14 +843,17 @@ class ElbManager(object):
         # True if succeeds, exception raised if not
         self.changed = self.elb_conn.create_load_balancer_listeners(self.name,
                                                                     complex_listeners=listeners)
+        if self.changed:
+            self.changer.append("_create_elb_listeners")
 
     def _delete_elb_listeners(self, listeners):
         """Takes a list of listener tuples and deletes them from the elb"""
         ports = [l[0] for l in listeners]
 
         # True if succeeds, exception raised if not
-        self.changed = self.elb_conn.delete_load_balancer_listeners(self.name,
-                                                                    ports)
+        self.changed = self.elb_conn.delete_load_balancer_listeners(self.name, ports)
+        if self.changed:
+            self.changer.append("_delete_elb_listeners")
 
     def _set_elb_listeners(self):
         """
@@ -823,6 +951,7 @@ class ElbManager(object):
             else:
                 self.module.fail_json(msg="an unknown server error occurred, please try again later")
         self.changed = True
+        self.changer.append("_enable_zones")
 
     def _disable_zones(self, zones):
         try:
@@ -833,14 +962,17 @@ class ElbManager(object):
             else:
                 self.module.fail_json(msg="an unknown server error occurred, please try again later")
         self.changed = True
+        self.changer.append("_disable_zones")
 
     def _attach_subnets(self, subnets):
         self.elb_conn.attach_lb_to_subnets(self.name, subnets)
         self.changed = True
+        self.changer.append("_attach_subnets")
 
     def _detach_subnets(self, subnets):
         self.elb_conn.detach_lb_from_subnets(self.name, subnets)
         self.changed = True
+        self.changer.append("_detach_subnets")
 
     def _set_subnets(self):
         """Determine which subnets need to be attached or detached on the ELB"""
@@ -879,6 +1011,7 @@ class ElbManager(object):
         if self.security_group_ids != None and set(self.elb.security_groups) != set(self.security_group_ids):
             self.elb_conn.apply_security_groups_to_lb(self.name, self.security_group_ids)
             self.changed = True
+            self.changer.append("_set_security_groups")
 
     def _set_health_check(self):
         """Set health check values on ELB as needed"""
@@ -909,6 +1042,7 @@ class ElbManager(object):
             if update_health_check:
                 self.elb.configure_health_check(self.elb.health_check)
                 self.changed = True
+                self.changer.append("_set_health_check")
 
     def _check_attribute_support(self, attr):
         return hasattr(boto.ec2.elb.attributes.LbAttributes(), attr)
@@ -918,10 +1052,12 @@ class ElbManager(object):
         if self.cross_az_load_balancing:
             if not attributes.cross_zone_load_balancing.enabled:
                 self.changed = True
+                self.changer.append("_set_cross_az_load_balancing")
             attributes.cross_zone_load_balancing.enabled = True
         else:
             if attributes.cross_zone_load_balancing.enabled:
                 self.changed = True
+                self.changer.append("_set_cross_az_load_balancing")
             attributes.cross_zone_load_balancing.enabled = False
         self.elb_conn.modify_lb_attribute(self.name, 'CrossZoneLoadBalancing',
                                           attributes.cross_zone_load_balancing.enabled)
@@ -947,9 +1083,11 @@ class ElbManager(object):
             if update_access_logs_config:
                 self.elb_conn.modify_lb_attribute(self.name, 'AccessLog', attributes.access_log)
                 self.changed = True
+                self.changer.append("_set_access_logs")
         elif attributes.access_log.enabled:
             attributes.access_log.enabled = False
             self.changed = True
+            self.changer.append("_set_access_logs")
             self.elb_conn.modify_lb_attribute(self.name, 'AccessLog', attributes.access_log)
 
     def _set_connection_draining_timeout(self):
@@ -958,12 +1096,14 @@ class ElbManager(object):
             if not attributes.connection_draining.enabled or \
                     attributes.connection_draining.timeout != self.connection_draining_timeout:
                 self.changed = True
+                self.changer.append("_set_connection_draining_timeout")
             attributes.connection_draining.enabled = True
             attributes.connection_draining.timeout = self.connection_draining_timeout
             self.elb_conn.modify_lb_attribute(self.name, 'ConnectionDraining', attributes.connection_draining)
         else:
             if attributes.connection_draining.enabled:
                 self.changed = True
+                self.changer.append("_set_connection_draining_timeout")
             attributes.connection_draining.enabled = False
             self.elb_conn.modify_lb_attribute(self.name, 'ConnectionDraining', attributes.connection_draining)
 
@@ -972,6 +1112,7 @@ class ElbManager(object):
         if self.idle_timeout is not None:
             if attributes.connecting_settings.idle_timeout != self.idle_timeout:
                 self.changed = True
+                self.changer.append("_set_idle_timeout")
             attributes.connecting_settings.idle_timeout = self.idle_timeout
             self.elb_conn.modify_lb_attribute(self.name, 'ConnectingSettings', attributes.connecting_settings)
 
@@ -1000,10 +1141,12 @@ class ElbManager(object):
                     self._set_listener_policy(listeners_dict)
                     self._update_policy(policy_attrs['param_value'], policy_attrs['method'], policy_attrs['attr'], policy[0])
                     self.changed = True
+                    self.changer.append("_set_stickiness_policy")
                 break
         else:
             self._create_policy(policy_attrs['param_value'], policy_attrs['method'], policy[0])
             self.changed = True
+            self.changer.append("_set_stickiness_policy")
 
         self._set_listener_policy(listeners_dict, policy)
 
@@ -1044,8 +1187,7 @@ class ElbManager(object):
                     if len(elb_info.policies.lb_cookie_stickiness_policies):
                         if elb_info.policies.lb_cookie_stickiness_policies[0].policy_name == self._policy_name(policy_type):
                             self.changed = True
-                    else:
-                        self.changed = False
+                            self.changer.append("select_stickiness_policy")
                     self._set_listener_policy(listeners_dict)
                     self._delete_policy(self.elb.name, self._policy_name(policy_type))
 
@@ -1070,6 +1212,7 @@ class ElbManager(object):
                     if len(elb_info.policies.app_cookie_stickiness_policies):
                         if elb_info.policies.app_cookie_stickiness_policies[0].policy_name == self._policy_name(policy_type):
                             self.changed = True
+                            self.changer.append("select_stickiness_policy")
                     self._set_listener_policy(listeners_dict)
                     self._delete_policy(self.elb.name, self._policy_name(policy_type))
 
@@ -1115,6 +1258,7 @@ class ElbManager(object):
         for item in replace:
             self.elb_conn.set_lb_policies_of_backend_server(self.elb.name, item['port'], item['policies'])
             self.changed = True
+            self.changer.append("_set_backend_policies")
 
     def _get_proxy_protocol_policy(self):
         """Find out if the elb has a proxy protocol enabled"""
@@ -1134,6 +1278,7 @@ class ElbManager(object):
                 self.elb.name, 'ProxyProtocol-policy', 'ProxyProtocolPolicyType', {'ProxyProtocol': True}
             )
             self.changed = True
+            self.changer.append("_set_proxy_protocol_policy")
 
         # TODO: remove proxy protocol policy if not needed anymore? There is no side effect to leaving it there
 
@@ -1154,6 +1299,7 @@ class ElbManager(object):
     def _set_instance_ids(self):
         """Register or deregister instances from an lb instance"""
         assert_instances = self.instance_ids or []
+        has_instances = []
 
         has_instances = self._get_instance_ids()
 
@@ -1161,48 +1307,15 @@ class ElbManager(object):
         if add_instances:
             self.elb_conn.register_instances(self.elb.name, add_instances)
             self.changed = True
+            self.changer.append("_set_instance_ids")
 
         if self.purge_instance_ids:
             remove_instances = self._diff_list(has_instances, assert_instances)
             if remove_instances:
                 self.elb_conn.deregister_instances(self.elb.name, remove_instances)
                 self.changed = True
+                self.changer.append("_set_instance_ids")
 
-    def _set_tags(self):
-        """Add/Delete tags"""
-        if self.tags is None:
-            return
-        
-        params = {'LoadBalancerNames.member.1': self.name}
-
-        tagdict = dict()
-
-        # get the current list of tags from the ELB, if ELB exists
-        if self.elb:
-            current_tags = self.elb_conn.get_list('DescribeTags', params,
-                                                  [('member', Tag)])
-            tagdict = dict((tag.Key, tag.Value) for tag in current_tags
-                           if hasattr(tag, 'Key'))
-            
-        # Add missing tags 
-        dictact = dict(set(self.tags.items()) - set(tagdict.items()))
-        if dictact:
-            for i, key in enumerate(dictact):
-                params['Tags.member.%d.Key' % (i + 1)] = key
-                params['Tags.member.%d.Value' % (i + 1)] = dictact[key]
-
-            self.elb_conn.make_request('AddTags', params)
-            self.changed=True
-
-        # Remove extra tags 
-        dictact = dict(set(tagdict.items()) - set(self.tags.items()))
-        if dictact:
-            for i, key in enumerate(dictact):
-                params['Tags.member.%d.Key' % (i + 1)] = key
-
-            self.elb_conn.make_request('RemoveTags', params)
-            self.changed=True
-    
     def _get_health_check_target(self):
         """Compose target string from healthcheck parameters"""
         protocol = self.health_check['ping_protocol'].upper()
@@ -1238,21 +1351,17 @@ def main():
             access_logs={'default': None, 'required': False, 'type': 'dict'},
             wait={'default': False, 'type': 'bool', 'required': False},
             wait_timeout={'default': 60, 'type': 'int', 'required': False},
-            tags={'default': None, 'required': False, 'type': 'dict'}
+            tags={'default': None, 'required': False, 'type': 'dict'},
+            append_tags={'default': False, 'required': False, 'type': 'bool'}
         )
     )
 
     module = AnsibleModule(
         argument_spec=argument_spec,
-        mutually_exclusive = [['security_group_ids', 'security_group_names']]
+        mutually_exclusive = [['security_group_ids', 'security_group_names']],
+        # TODO: this breaks backwards compatibility
+        #required_if = [('append_tags', 'True', ['tags'])]
     )
-
-    if not HAS_BOTO:
-        module.fail_json(msg='boto required for this module')
-
-    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
-    if not region:
-        module.fail_json(msg="Region must be specified as a parameter, in EC2_REGION or AWS_REGION environment variables or in boto configuration file")
 
     name = module.params['name']
     state = module.params['state']
@@ -1276,7 +1385,19 @@ def main():
     wait = module.params['wait']
     wait_timeout = module.params['wait_timeout']
     tags = module.params['tags']
-    
+    append_tags = module.params['append_tags']
+
+    # TODO: upgrade v2 module_utils/basic.py and use require_if
+    if append_tags and not tags:
+        module.fail_json(msg='tags required when specifying append_tags')
+
+    if not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
+
+    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
+    if not region:
+        module.fail_json(msg="Region must be specified as a parameter, in EC2_REGION or AWS_REGION environment variables or in boto configuration file")
+
     if state == 'present' and not listeners:
         module.fail_json(msg="At least one port is required for ELB creation")
 
@@ -1302,15 +1423,30 @@ def main():
             module.fail_json(msg = str(e))
 
 
-    elb_man = ElbManager(module, name, listeners, purge_listeners, zones,
-                         purge_zones, security_group_ids, health_check,
-                         subnets, purge_subnets, scheme,
-                         connection_draining_timeout, idle_timeout,
+    elb_man = ElbManager(module,
+                         name,
+                         region,
+                         listeners,
+                         purge_listeners,
+                         zones,
+                         purge_zones,
+                         security_group_ids,
+                         health_check,
+                         subnets,
+                         purge_subnets,
+                         scheme,
+                         connection_draining_timeout,
+                         idle_timeout,
                          cross_az_load_balancing,
-                         access_logs, stickiness, wait, wait_timeout, tags,
-                         region=region, instance_ids=instance_ids, purge_instance_ids=purge_instance_ids,
+                         access_logs,
+                         stickiness,
+                         wait,
+                         wait_timeout,
+                         tags,
+                         append_tags,
+                         instance_ids,
+                         purge_instance_ids,
                          **aws_connect_params)
-
 
     # check for unsupported attributes for this version of boto
     if cross_az_load_balancing and not elb_man._check_attribute_support('cross_zone_load_balancing'):

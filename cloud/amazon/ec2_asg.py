@@ -512,15 +512,19 @@ def delete_autoscaling_group(connection, module):
     if groups:
         group = groups[0]
         group.shutdown_instances()
-        while True:
+        delete_attempts = 0
+        while delete_attempts < 60: # 10minutes
             try:
                 group.delete()
                 break
             except BotoServerError, e:
                 if e.error_code == 'ScalingActivityInProgress' or e.error_code == 'ResourceInUse':
                     time.sleep(10)
+                    delete_attempts += 1
                 else:
-                    raise e
+                    module.fail_json(msg='ASG deletion error: ' + str(e))
+        if delete_attempts == 60:
+            module.fail_json(msg='ASG deletion error: timeout')
         while len(connection.get_all_groups(names=[group_name])):
             time.sleep(5)
         changed=True

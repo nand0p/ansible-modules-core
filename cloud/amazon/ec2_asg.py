@@ -21,7 +21,9 @@ description:
   - Can create or delete AWS Autoscaling Groups
   - Works with the ec2_lc module to manage Launch Configurations
 version_added: "1.6"
-author: "Gareth Rushgrove (@garethr)"
+author:
+  - "Gareth Rushgrove (@garethr)"
+  - "Fernando Jose Pando (@nand0p)"
 options:
   state:
     description:
@@ -509,20 +511,16 @@ def delete_autoscaling_group(connection, module):
     groups = connection.get_all_groups(names=[group_name])
     if groups:
         group = groups[0]
-        group.max_size = 0
-        group.min_size = 0
-        group.desired_capacity = 0
-        group.update()
-        instances = True
-        while instances:
-            tmp_groups = connection.get_all_groups(names=[group_name])
-            if tmp_groups:
-                tmp_group = tmp_groups[0]
-                if not tmp_group.instances:
-                    instances = False
-            time.sleep(10)
-
-        group.delete()
+        group.shutdown_instances()
+        while True:
+            try:
+                group.delete()
+                break
+            except BotoServerError, e:
+                if e.error_code == 'ScalingActivityInProgress' or e.error_code == 'ResourceInUse':
+                    time.sleep(10)
+                else:
+                    raise e
         while len(connection.get_all_groups(names=[group_name])):
             time.sleep(5)
         changed=True

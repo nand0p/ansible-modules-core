@@ -204,6 +204,7 @@ to "replace_instances":
 
 import time
 import logging as log
+import random
 
 from ansible.module_utils.basic import *
 from ansible.module_utils.ec2 import *
@@ -511,13 +512,13 @@ def delete_autoscaling_group(connection, module):
     if groups:
         group = groups[0]
         group.shutdown_instances()
-        for delete_attempts in range(60): # 10minutes
+        for delete_attempts in range(12):
             try:
                 group.delete()
                 return True
             except BotoServerError, err:
                 if err.error_code == 'ScalingActivityInProgress' or err.error_code == 'ResourceInUse':
-                    time.sleep(10)
+                    time.sleep(min(random.random() * 2 ** delete_attempts, 300))
                 else:
                     module.fail_json(msg='ASG deletion error: ' + err.message)
         module.fail_json(msg='ASG deletion timeout')

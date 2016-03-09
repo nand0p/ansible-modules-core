@@ -258,6 +258,7 @@ author:
     - "Tim Gerla (@tgerla)"
     - "Lester Wade (@lwade)"
     - "Seth Vidal"
+    - "Fernando Jose Pando (@nand0p)"
 extends_documentation_fragment: aws
 '''
 
@@ -562,6 +563,7 @@ EXAMPLES = '''
 '''
 
 import time
+import random
 from ast import literal_eval
 
 try:
@@ -1100,13 +1102,15 @@ def create_instances(module, ec2, vpc, override_count=None):
 
         # wait here until the instances are up
         num_running = 0
+        wait_count = 0
         wait_timeout = time.time() + wait_timeout
         while wait_timeout > time.time() and num_running < len(instids):
             try:
                 res_list = ec2.get_all_instances(instids)
             except boto.exception.BotoServerError, e:
                 if e.error_code == 'InvalidInstanceID.NotFound':
-                    time.sleep(1)
+                    time.sleep(min(random.random() * 2 ** wait_count, 30))
+                    wait_count += 1
                     continue
                 else:
                     raise
@@ -1202,6 +1206,7 @@ def terminate_instances(module, ec2, instance_ids):
     # wait here until the instances are 'terminated'
     if wait:
         num_terminated = 0
+        wait_count = 0
         wait_timeout = time.time() + wait_timeout
         while wait_timeout > time.time() and num_terminated < len(terminated_instance_ids):
             response = ec2.get_all_instances( \
@@ -1212,7 +1217,8 @@ def terminate_instances(module, ec2, instance_ids):
             except Exception, e:
                 # got a bad response of some sort, possibly due to
                 # stale/cached data. Wait a second and then try again
-                time.sleep(1)
+                time.sleep(min(random.random() * 2 ** wait_count, 30))
+                wait_count += 1
                 continue
 
             if num_terminated < len(terminated_instance_ids):

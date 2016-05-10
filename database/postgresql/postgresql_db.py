@@ -147,25 +147,24 @@ def get_db_info(cursor, db):
     return cursor.fetchone()
 
 def db_exists(cursor, db):
-    query = "SELECT * FROM pg_database WHERE datname = '%s'" % db
+    query = "SELECT * FROM pg_database WHERE datname = %(db)s"
     cursor.execute(query, {'db': db})
     return cursor.rowcount == 1
 
-def db_sessions_exist(cursor, db):
-    query = "SELECT * FROM pg_stat_activity WHERE datname = '%s'" % db
-    cursor.execute(query, {'db': db})
-    return cursor.rowcount > 0
+def db_sessions_disconnect(cursor, db):
+    query_disconnect = """
+    SELECT pg_terminate_backend(pg_stat_activity.pid)
+    FROM pg_stat_activity
+    WHERE pg_stat_activity.datname = %(db)s
+    AND pid <> pg_backend_pid()
+    """
+    cursor.execute(query_disconnect, {'db': db})
 
 def db_delete(cursor, db):
     if db_exists(cursor, db):
-        if db_sessions_exist(cursor, db):
-            query_disconnect = "SELECT pg_terminate_backend(pg_stat_activity.pid) \
-                                FROM pg_stat_activity \
-                                WHERE pg_stat_activity.datname = '%s' \
-                                AND pid <> pg_backend_pid()" % db
-            cursor.execute(query_disconnect)
-        query_drop = "DROP DATABASE %s" % pg_quote_identifier(db, 'database')
-        cursor.execute(query_drop)
+        db_sessions_disconnect(cursor, db)
+        query = "DROP DATABASE %s" % pg_quote_identifier(db, 'database')
+        cursor.execute(query)
         return True
     else:
         return False
